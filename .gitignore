@@ -1,0 +1,19 @@
+# Never commit real secrets - only .env.example files belong in git.
+# This is the exact mistake flagged as a security breach in
+# corpapps-itp-frontend PR 228187 - guarding against it here too.
+.env
+.env.local
+.env.*.local
+backend/.env
+frontend/.env
+frontend/.env.local
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Node
+node_modules/
+dist/

@@ -1,0 +1,145 @@
+<!--
+  APIM inbound policy - validates the Entra ID access token at the gateway,
+  then forwards a plain X-User-Id / X-User-Roles header pair to FastAPI and
+  strips the raw Authorization header before forwarding.
+
+  This is the SAME defense-in-depth pattern already used in the CTC ITP
+  Release 2 architecture (see CTC_ITP_R2_Technical_Architecture.docx,
+  Section 5): APIM does the real token validation once at the edge; the
+  backend either trusts the injected headers (TRUST_APIM_HEADERS=True) or -
+  for local dev without APIM in front - validates the raw JWT itself.
+
+  Where to apply this: Azure Portal > API Management > APIs > <your API> >
+  Design tab > Inbound processing > </> (Add policy / Code editor).
+
+  {{tenant-id}}, {{api-audience}}, and {{api-client-id}} below are APIM
+  Named Values, not literal placeholders to find-and-replace - create them
+  first under API Management > Named values:
+    tenant-id     = your Entra ID tenant ID
+    api-audience  = the API App Registration's Application ID URI, EXACTLY
+                    as shown on Azure Portal > App registrations > <your API
+                    app> > Expose an API > Application ID URI (Step 2 of the
+                    setup guide). Do NOT assume this is "api://<client-id>" -
+                    some orgs configure a custom URI instead (e.g.
+                    "https://<tenant>.onmicrosoft.com/<custom-spn-name>").
+                    Copy the value shown in the portal verbatim.
+    api-client-id = the bare Application (client) ID GUID (no "api://"
+                    prefix) - needed alongside api-audience because Azure AD
+                    v2.0 access tokens use the bare GUID as `aud`, while
+                    v1.0 tokens use the full Application ID URI. Both are
+                    legitimate depending on which token version gets issued
+                    (see the <audiences>/<issuers> blocks below) - this
+                    mirrors the same dual-format handling added to the
+                    backend's config.py/auth.py after live testing surfaced
+                    the mismatch.
+  Named Values let you change tenant/app IDs per environment (dev/qa/prod)
+  without editing this policy at all - the standard APIM way to do this.
+
+  This version also mirrors the real policy shape used elsewhere in this
+  org's APIM instance (see e.g. squads/corpapps/dev/cc/apis/itp-backend/qa/
+  policy.xml in the corp-ado-032 repo): subscription-key stripping, a named
+  backend-service, and a rewrite-uri. That file has NO <validate-jwt> yet -
+  it only does CORS + routing, so no identity is checked at the gateway for
+  that API today. The <validate-jwt> + header-injection block below is the
+  piece this guide adds on top of that same shape to implement Option 2a.
+-->
+<policies>
+    <inbound>
+        <base />
+
+        <!-- 1. CORS MUST come before validate-jwt. APIM's <cors> policy
+             intercepts and answers OPTIONS preflight requests itself -
+             browsers never send an Authorization header on preflight, so if
+             validate-jwt ran first, every preflight would be rejected with
+             401 before <cors> ever got a chance to handle it. -->
+        <cors allow-credentials="true">
+            <allowed-origins>
+                <origin>http://localhost:5173</origin>
+                <!-- <origin>https://your-production-spa.ctc.com</origin> -->
+            </allowed-origins>
+            <allowed-methods>
+                <method>GET</method>
+                <method>POST</method>
+                <method>PUT</method>
+                <method>DELETE</method>
+                <method>OPTIONS</method>
+            </allowed-methods>
+            <allowed-headers>
+                <header>*</header>
+            </allowed-headers>
+        </cors>
+
+        <!-- 2. If this API is also protected by an APIM product subscription
+             key (separate from user identity - it authorizes the calling
+             app/client, not the end user), strip it before forwarding so it
+             never leaks to the backend. Matches the subscription-key
+             handling in itp-backend/qa/policy.xml. Remove this line if your
+             API's product doesn't require a subscription key. -->
+        <set-query-parameter name="subscription-key" exists-action="delete" />
+
+        <!-- 3. Validate the bearer token's signature, issuer, audience, and
+             expiry. Both <audiences> and <issuers> list TWO valid forms -
+             v1.0 and v2.0 token formats - because live testing showed Azure
+             AD issues v1.0-format tokens (sts.windows.net issuer, api://<id>
+             audience) when an app requests a token for ITSELF (one combined
+             SPA+API registration, as configured for this project), and
+             v2.0-format tokens (login.microsoftonline.com/.../v2.0 issuer,
+             bare <id> audience) otherwise - regardless of the API app's
+             accessTokenAcceptedVersion manifest setting, which only affects
+             tokens requested by a DIFFERENT client. Rejecting either form
+             outright would incorrectly fail legitimate tokens. -->
+        <validate-jwt header-name="Authorization" failed-validation-httpcode="401" require-scheme="Bearer" failed-validation-error-message="Unauthorized - invalid or missing token">
+            <openid-config url="https://login.microsoftonline.com/{{tenant-id}}/v2.0/.well-known/openid-configuration" />
+            <audiences>
+                <audience>{{api-audience}}</audience>
+                <audience>{{api-client-id}}</audience>
+            </audiences>
+            <issuers>
+                <issuer>https://login.microsoftonline.com/{{tenant-id}}/v2.0</issuer>
+                <issuer>https://sts.windows.net/{{tenant-id}}/</issuer>
+            </issuers>
+            <required-claims>
+                <claim name="aud" match="any" />
+            </required-claims>
+        </validate-jwt>
+
+        <!-- 4. Extract claims from the now-validated token and inject them as
+             plain headers FastAPI can read without re-parsing the JWT. -->
+        <set-variable name="jwtSubject" value="@(context.Request.Headers.GetValueOrDefault(&quot;Authorization&quot;,&quot;&quot;).Split(' ').Last().AsJwt()?.Subject)" />
+        <set-variable name="jwtRoles" value="@{
+            var jwt = context.Request.Headers.GetValueOrDefault(&quot;Authorization&quot;,&quot;&quot;).Split(' ').Last().AsJwt();
+            var roles = jwt?.Claims.ContainsKey(&quot;roles&quot;) == true ? jwt.Claims[&quot;roles&quot;] : new string[0];
+            return string.Join(&quot;,&quot;, roles);
+        }" />
+
+        <set-header name="X-User-Id" exists-action="override">
+            <value>@((string)context.Variables["jwtSubject"])</value>
+        </set-header>
+        <set-header name="X-User-Roles" exists-action="override">
+            <value>@((string)context.Variables["jwtRoles"])</value>
+        </set-header>
+
+        <!-- 5. Strip the raw Authorization header before forwarding - FastAPI
+             behind APIM should never see the original bearer token, only the
+             two headers above. This is what makes trust_apim_headers=True safe. -->
+        <set-header name="Authorization" exists-action="delete" />
+
+        <!-- 6. Route to your backend the same way itp-backend/qa/policy.xml
+             does - a named backend-service plus a rewrite-uri, instead of a
+             hardcoded URL. Create the backend under API Management > Backends
+             first, and set {{backend-id}} / {{api-path-prefix}} as Named
+             Values (or replace inline). Remove both lines if your API's
+             "Web service URL" already points straight at FastAPI. -->
+        <set-backend-service backend-id="{{backend-id}}" />
+        <rewrite-uri template="@(&quot;/&quot; + &quot;{{api-path-prefix}}&quot; + context.Operation.UrlTemplate + context.Request.Url.QueryString)" />
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>

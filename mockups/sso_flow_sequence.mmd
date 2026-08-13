@@ -1,0 +1,25 @@
+sequenceDiagram
+    autonumber
+    participant User
+    participant SPA as React SPA (MSAL.js)
+    participant Entra as Microsoft Entra ID
+    participant APIM as Azure APIM
+    participant BE as FastAPI Backend
+
+    User->>SPA: Click "Sign in with Microsoft"
+    SPA->>Entra: loginPopup() - auth code + PKCE flow
+    Entra->>User: Show login prompt (if not already signed in)
+    User->>Entra: Enter credentials / consent
+    Entra-->>SPA: ID token + auth code
+    SPA->>Entra: acquireTokenSilent() - exchange for access token (audience = API scope)
+    Entra-->>SPA: Access token (aud = api://API-client-id)
+
+    SPA->>APIM: GET /api/profile + Authorization Bearer token
+    APIM->>APIM: validate-jwt (signature via JWKS, issuer, audience, expiry)
+    APIM->>APIM: decode token -> extract Name + Roles (Option 2a)
+    APIM->>APIM: set X-User-Id / X-User-Roles headers, delete Authorization header
+    APIM->>BE: forward request (no raw token, just X-User-Id/X-User-Roles)
+    BE->>BE: trust_apim_headers=True -> read headers directly, no JWT decode
+    BE-->>APIM: 200 {subject, name, roles}
+    APIM-->>SPA: 200 response
+    SPA->>User: Display profile
