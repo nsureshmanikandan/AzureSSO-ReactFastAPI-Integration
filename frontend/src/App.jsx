@@ -189,12 +189,6 @@ export default function App() {
 
       <footer className="app-footer">
         <p>&copy; {new Date().getFullYear()} CTC SSO Sample. Internal demo — Azure Entra ID integration.</p>
-        <div className="tech-pills">
-          <span className="tech-pill">React</span>
-          <span className="tech-pill">MSAL</span>
-          <span className="tech-pill">FastAPI</span>
-          <span className="tech-pill">Azure Entra ID</span>
-        </div>
       </footer>
     </div>
   );
