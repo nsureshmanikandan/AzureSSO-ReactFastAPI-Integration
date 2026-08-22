@@ -26,3 +26,7 @@ output "static_web_app_api_key" {
   value     = azurerm_static_web_app.frontend.api_key
   sensitive = true
 }
+
+output "apim_gateway_url" {
+  value = azurerm_api_management.main.gateway_url
+}

@@ -55,7 +55,7 @@
         <cors allow-credentials="true">
             <allowed-origins>
                 <origin>http://localhost:5173</origin>
-                <!-- <origin>https://your-production-spa.ctc.com</origin> -->
+                <origin>https://proud-ground-00667a40f.7.azurestaticapps.net</origin>
             </allowed-origins>
             <allowed-methods>
                 <method>GET</method>
@@ -125,13 +125,22 @@
         <set-header name="Authorization" exists-action="delete" />
 
         <!-- 6. Route to your backend the same way itp-backend/qa/policy.xml
-             does - a named backend-service plus a rewrite-uri, instead of a
-             hardcoded URL. Create the backend under API Management > Backends
-             first, and set {{backend-id}} / {{api-path-prefix}} as Named
-             Values (or replace inline). Remove both lines if your API's
-             "Web service URL" already points straight at FastAPI. -->
+             does - a named backend-service, instead of a hardcoded URL.
+             Create the backend under API Management > Backends first, and
+             set {{backend-id}} as a Named Value (or replace inline).
+             No rewrite-uri needed when the operation's URL template already
+             matches the backend's real path exactly (our case: /health and
+             /api/profile are the same on both sides). If your backend needs
+             a path prefix stripped/added, add a rewrite-uri here instead -
+             but do NOT hardcode a leading "/" + an api-path-prefix Named
+             Value the way an earlier version of this file did: Azure API
+             Management Named Values cannot be an empty string, so there is
+             no valid "no prefix" value, and a bare "/" + "" produces a
+             double slash (e.g. "//health") that most backend routers -
+             including FastAPI/Starlette - will NOT match, causing silent
+             404s. Only add the rewrite-uri line at all when you have a real,
+             non-empty prefix to substitute in. -->
         <set-backend-service backend-id="{{backend-id}}" />
-        <rewrite-uri template="@(&quot;/&quot; + &quot;{{api-path-prefix}}&quot; + context.Operation.UrlTemplate + context.Request.Url.QueryString)" />
     </inbound>
     <backend>
         <base />

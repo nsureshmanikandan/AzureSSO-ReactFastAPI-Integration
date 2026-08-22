@@ -70,8 +70,8 @@ export default function App() {
 
   const account = accounts[0];
 
-  const login = () => instance.loginPopup({ scopes: ["User.Read"] });
-  const logout = () => instance.logoutPopup();
+  const login = () => instance.loginRedirect({ scopes: ["User.Read"] });
+  const logout = () => instance.logoutRedirect();
 
   const callProfile = async () => {
     setError(null);
