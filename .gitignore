@@ -17,3 +17,13 @@ __pycache__/
 # Node
 node_modules/
 dist/
+
+# Terraform (state can contain object IDs/secrets - keep local).
+# .terraform.lock.hcl is intentionally NOT ignored - Terraform's own
+# guidance is to commit it so provider version selection is reproducible.
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfplan
+infra/terraform-hosting/schema.json
+infra/terraform/schema.json

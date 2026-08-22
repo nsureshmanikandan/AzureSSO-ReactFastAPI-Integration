@@ -1,0 +1,110 @@
+﻿# Code deployment pipeline - builds and deploys the backend (FastAPI ->
+# Container App) and frontend (React/Vite -> Static Web App).
+#
+# This is separate from infra/terraform (the SSO app registration) and
+# infra/terraform-hosting (the Container App / ACR / Static Web App /
+# Resource Group themselves) - those are provisioned once, ahead of time,
+# by a human running `terraform apply` locally (see AZURE_DEPLOYMENT_GUIDE.md).
+# This pipeline only pushes application CODE into infra that already exists.
+#
+# Prerequisites (one-time, in Azure DevOps):
+#   - An Azure Resource Manager service connection named in
+#     $(azureServiceConnection) with Contributor on the resource group
+#     created by infra/terraform-hosting (rg-itp-demo-dev by default).
+#   - Pipeline variables (mark swaDeploymentToken as secret):
+#       azureServiceConnection = <your ADO service connection name>
+#       resourceGroupName      = rg-itp-demo-dev
+#       acrLoginServer         = <terraform output -raw acr_login_server>
+#       containerAppName       = ca-itp-backend-dev
+#       swaDeploymentToken     = <terraform output -raw static_web_app_api_key>
+#       apiBaseUrl             = https://<containerAppName>.<region>.azurecontainerapps.io
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - backend/*
+      - frontend/*
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  imageName: 'itp-backend'
+  imageTag: '$(Build.BuildId)'
+
+stages:
+  # ------------------------------------------------------------- backend --
+  - stage: Backend
+    jobs:
+      - job: test_build_push
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.12'
+
+          - script: |
+              cd backend
+              python -m pip install --upgrade pip
+              pip install -r requirements.txt
+              python -m pytest -q
+            displayName: 'Install deps and run backend tests'
+
+          - task: AzureCLI@2
+            displayName: 'az acr build (build + push in one step, no local docker needed)'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az acr build \
+                  --registry $(acrLoginServer) \
+                  --image $(imageName):$(imageTag) \
+                  --image $(imageName):latest \
+                  backend
+
+      - job: deploy_backend
+        dependsOn: test_build_push
+        steps:
+          - task: AzureCLI@2
+            displayName: 'az containerapp update - roll out new image'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az containerapp update \
+                  --name $(containerAppName) \
+                  --resource-group $(resourceGroupName) \
+                  --image $(acrLoginServer)/$(imageName):$(imageTag)
+
+  # ------------------------------------------------------------ frontend --
+  - stage: Frontend
+    dependsOn: Backend
+    jobs:
+      - job: build_deploy_frontend
+        steps:
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '20.x'
+
+          - script: |
+              cd frontend
+              npm ci
+              npm run build
+            displayName: 'npm build'
+            env:
+              VITE_AZURE_CLIENT_ID: $(viteAzureClientId)
+              VITE_AZURE_TENANT_ID: $(viteAzureTenantId)
+              VITE_REDIRECT_URI: $(viteRedirectUri)
+              VITE_API_SCOPE: $(viteApiScope)
+              VITE_API_BASE_URL: $(apiBaseUrl)
+
+          - task: AzureStaticWebApp@0
+            inputs:
+              app_location: 'frontend'
+              output_location: 'dist'
+              skip_app_build: true
+              azure_static_web_apps_api_token: '$(swaDeploymentToken)'
