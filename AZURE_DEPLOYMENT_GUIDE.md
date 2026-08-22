@@ -1,20 +1,67 @@
 # Deploying to Azure
 
 Companion to [LOCAL_RUN_GUIDE.md](LOCAL_RUN_GUIDE.md) - this is the "next step"
-that guide pointed to. Two layers, provisioned separately on purpose:
+that guide pointed to. Verified working end-to-end on 2026-08-22: real sign-in,
+real token, APIM validation, roles claim, all confirmed live - not just planned.
 
-1. **Infra** (`infra/terraform-hosting/`) - Resource Group, Azure Container
-   Registry, Container Apps Environment + Container App (backend), Static
-   Web App (frontend). Provisioned once, by a human, ahead of time.
-2. **Code** (`pipelines/azure-pipelines.yml`) - builds and deploys the
-   backend image and frontend bundle into infra that already exists. Runs
-   on every push to `main` that touches `backend/` or `frontend/`.
+## Architecture
 
-The SSO app registration itself (`infra/terraform/`) is a third, separate
-piece - already covered by its own setup. This guide assumes that's done
-and you have its outputs (`terraform output backend_env` / `frontend_env`).
+```
+Browser (React/MSAL)
+    | loginRedirect -> Microsoft sign-in -> back to SPA
+    | "Call protected API" -> acquireTokenSilent (api://<client-id>/access_as_user)
+    v
+Static Web App (frontend/dist)
+    | Bearer <token>
+    v
+APIM gateway (apim-itp-demo-dev.azure-api.net)
+    | api-base-policy.xml   - CORS + routing, ALL operations (incl. /health)
+    | validate-jwt-policy.xml - ALSO applied, /api/profile operation ONLY
+    |   -> validates signature/issuer/audience/expiry
+    |   -> strips Authorization, injects X-User-Id / X-User-Name / X-User-Roles
+    v
+Container App (FastAPI, TRUST_APIM_HEADERS=True)
+    -> trusts the injected headers, never sees the raw token
+```
 
-## 1. Provision the hosting infra (one-time)
+Three separate Terraform states, applied in this order, by a human -
+nothing here is applied by CI:
+1. `infra/terraform/` - the SSO app registration (Entra ID / Graph only)
+2. `infra/terraform-hosting/` - Resource Group, ACR, Container Apps
+   Environment + Container App, Static Web App, **APIM**
+3. Application code - built and deployed by `.github/workflows/deploy.yml`
+   (GitHub Actions) into the infra that already exists
+
+## 1. SSO app registration
+
+```bash
+cd infra/terraform
+terraform init
+terraform apply
+```
+
+Creates one combined app registration (`corpapps-<env>-itp-backend-apim-spn`)
+that plays both the SPA and API roles, 8 App Roles, and demo AD groups - see
+the header comment on `resource "azuread_application" "app"` for what it
+actually does.
+
+**Known footgun, hit repeatedly during this deployment**: any update to this
+resource (even changing an unrelated field like `display_name` or
+`redirect_uris`) silently resets `identifierUris` and `requiredResourceAccess`
+back to empty on the real app, even though Terraform's own state still claims
+they exist. **Always run `terraform plan` again immediately after any apply
+here** - if it shows `azuread_application_identifier_uri.app` or
+`azuread_application_api_access.*` need recreating, `apply` again right away
+before considering the change done.
+
+Grab the outputs:
+```bash
+terraform output backend_env      # AZURE_TENANT_ID, AZURE_API_CLIENT_ID
+terraform output frontend_env     # VITE_* values for the SPA
+terraform output role_group_object_ids   # add yourself to one to get a role
+```
+
+## 2. Hosting infra (Resource Group, ACR, Container App, Static Web App, APIM)
 
 ```bash
 cd infra/terraform-hosting
@@ -22,95 +69,167 @@ terraform init
 terraform apply
 ```
 
-You'll be asked for `azure_tenant_id` and `azure_api_client_id` if they
-aren't already in a `*.auto.tfvars` file - use the values from
-`infra/terraform`'s `backend_env` output.
+Needs `azure_tenant_id` / `azure_api_client_id` (from step 1's `backend_env`)
+in a `*.auto.tfvars` file. Takes **8-12 minutes total** - the Container Apps
+Environment is a few minutes, APIM (Consumption SKU - fastest tier to
+provision) is the slowest part at ~2-3 minutes.
 
-This takes **5-10 minutes**, mostly the Container Apps Environment. It
-creates:
-- `rg-itp-demo-dev` (Resource Group)
-- An Azure Container Registry (Basic SKU, admin access enabled for the
-  pipeline to push to)
-- A Container Apps Environment + a Container App running a placeholder
-  image (`mcr.microsoft.com/azuredocs/containerapps-helloworld`) - the
-  pipeline replaces this with the real backend image on first deploy
-- A Static Web App (Free SKU) for the frontend
+Creates:
+- `rg-itp-demo-dev`, an Azure Container Registry (Basic, admin-enabled)
+- Container Apps Environment + Container App, starting on a placeholder
+  image - the pipeline replaces it with the real backend image on first
+  deploy
+- A Static Web App (Free SKU) - Azure Static Web Apps is **not available in
+  every region** (only `centralus`, `eastus2`, `westus2`, `westeurope`,
+  `eastasia` as of this writing); it has its own `static_web_app_location`
+  variable, separate from the general `location` variable, for this reason
+- APIM (`apim-itp-demo-dev`), one API (`itp-backend-api`), two operations
+  (`GET /health`, `GET /api/profile`), and two policies - see below
 
-Grab the outputs you'll need for the pipeline and for testing:
+**Before first apply, register the resource providers** if this is a fresh
+subscription (`Microsoft.App` is required for Container Apps and is not
+registered by default on every subscription):
 ```bash
+az provider register --namespace Microsoft.App
+az provider register --namespace Microsoft.OperationalInsights
+```
+
+**Known footgun**: once the CI/CD pipeline has deployed a real image via
+`az containerapp update`, running `terraform apply` here again for an
+unrelated reason (e.g. adding APIM) will revert the Container App back to
+the placeholder image, because Terraform doesn't know about the
+out-of-band `az cli` update. `main.tf` already has
+`lifecycle { ignore_changes = [template[0].container[0].image] }` on the
+Container App resource to prevent this - don't remove it.
+
+### APIM policy structure - why it's split into two files
+
+`apim/api-base-policy.xml` is applied at the **API level** (every
+operation, including the public `/health`). `apim/validate-jwt-policy.xml`
+is applied at the **operation level**, on `/api/profile` only. This split
+exists because:
+- Applying `validate-jwt` at the API level would also block the
+  intentionally-public `/health` endpoint.
+- Azure API Management Named Values **cannot be an empty string** - an
+  earlier version of the policy hardcoded a `"/" + "{{api-path-prefix}}" +
+  ...` rewrite-uri assuming an empty prefix was valid, which is both
+  rejected by Terraform's own validation and would have produced a
+  double-slash path (`//health`) that FastAPI/Starlette wouldn't route
+  correctly even if it were allowed. There is no rewrite-uri in the current
+  policy at all, since the operation URL templates already match the
+  backend's real paths exactly.
+- The API resource also needs `subscription_required = false` - Azure
+  defaults this to `true`, which rejects every request with a
+  "missing subscription key" error regardless of a valid bearer token,
+  since this design has no APIM product/subscription concept at all
+  (auth is JWT-only).
+
+Grab the outputs:
+```bash
+terraform output -raw apim_gateway_url            # https://apim-itp-demo-dev.azure-api.net
 terraform output -raw acr_login_server
-terraform output azurerm_container_app.backend  # or: az containerapp show ...
 terraform output -raw static_web_app_default_hostname
-terraform output -raw static_web_app_api_key      # secret - the SWA deployment token
+terraform output -raw static_web_app_api_key      # secret - SWA deployment token
 ```
 
-(If `outputs.tf` doesn't have these yet, add them - see the end of this
-file for the exact block.)
+## 3. Wire up the GitHub Actions pipeline (one-time)
 
-## 2. Wire up the Azure DevOps pipeline (one-time)
+This repo uses GitHub Actions (`.github/workflows/deploy.yml`), not Azure
+DevOps - `az acr build` (ACR Tasks) is blocked on some subscriptions
+(confirmed on this one), and Docker/WSL2 may not be installed locally
+either. GitHub's hosted runners have Docker built in, so the workflow does
+a plain `docker build` + `docker push` instead of `az acr build`.
 
-1. **Service connection**: Project Settings -> Service connections -> New
-   -> Azure Resource Manager, scoped to the resource group
-   `rg-itp-demo-dev`. Name it anything - you'll reference that name as the
-   `azureServiceConnection` pipeline variable.
-2. **Create the pipeline**: Pipelines -> New pipeline -> point it at
-   `pipelines/azure-pipelines.yml` in this repo.
-3. **Pipeline variables** (Edit -> Variables), matching the comment block
-   at the top of `azure-pipelines.yml`:
+1. **Create a service principal** scoped to the resource group, for the
+   pipeline to authenticate to Azure:
+   ```bash
+   az ad sp create-for-rbac --name "sp-itp-demo-github-actions" \
+     --role Contributor \
+     --scopes /subscriptions/<sub-id>/resourceGroups/rg-itp-demo-dev
+   ```
+2. **Set GitHub repo secrets** (`gh secret set NAME --body "value" -R <repo>`
+   - use `--body`, not a piped string; piping a plain string through
+   PowerShell's stdin appends a trailing newline that silently corrupts the
+   secret value, which is exactly what happened to `ACR_LOGIN_SERVER` and
+   `SWA_DEPLOYMENT_TOKEN` the first time):
 
-   | Variable | Value | Secret? |
-   |---|---|---|
-   | `azureServiceConnection` | the service connection name from step 1 | no |
-   | `resourceGroupName` | `rg-itp-demo-dev` | no |
-   | `acrLoginServer` | `terraform output -raw acr_login_server` | no |
-   | `containerAppName` | `ca-itp-backend-dev` | no |
-   | `swaDeploymentToken` | `terraform output -raw static_web_app_api_key` | **yes** |
-   | `viteAzureClientId` | `infra/terraform`'s `frontend_env` -> `VITE_AZURE_CLIENT_ID` | no |
-   | `viteAzureTenantId` | same output -> `VITE_AZURE_TENANT_ID` | no |
-   | `viteRedirectUri` | your real hosted SPA URL, e.g. `https://<swa-hostname>/` | no |
-   | `viteApiScope` | same output -> `VITE_API_SCOPE` | no |
-   | `apiBaseUrl` | `https://<containerAppName>.<region>.azurecontainerapps.io` (get exact FQDN via `az containerapp show -n ca-itp-backend-dev -g rg-itp-demo-dev --query properties.configuration.ingress.fqdn -o tsv`) | no |
+   | Secret | Value |
+   |---|---|
+   | `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` / `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID` | from the service principal above |
+   | `ACR_LOGIN_SERVER` | `terraform output -raw acr_login_server` |
+   | `ACR_USERNAME` / `ACR_PASSWORD` | `az acr credential show --name <acr-name>` |
+   | `SWA_DEPLOYMENT_TOKEN` | `terraform output -raw static_web_app_api_key` |
 
-4. **Add the hosted redirect URI to the app registration** - the SPA is
-   now served from the Static Web App's real URL, not just
-   `localhost:5173`. Add it in `infra/terraform`'s `redirect_uris` variable
-   and re-apply (see the drift warning comment in `main.tf` - plan again
-   right after to confirm nothing else got reset).
-5. **Add the SWA origin to CORS** - update `allowed_origins` in
-   `infra/terraform-hosting`'s tfvars and `terraform apply` again (this
-   updates the Container App's `ALLOWED_ORIGINS` env var).
+3. **Hardcoded values in `deploy.yml`'s frontend build step** (`VITE_*` env
+   vars) need updating if you change tenant/client ID or hostnames - they
+   aren't parameterized as secrets since they aren't sensitive.
 
-## 3. Run it
+## 4. Run it
 
-Push to `main` (touching `backend/` or `frontend/`), or run the pipeline
-manually. It will:
-- Install backend deps, run `pytest`
-- `az acr build` (builds the Docker image *in* ACR - no local Docker
-  needed on the agent)
-- `az containerapp update` with the new image
-- `npm ci && npm run build` for the frontend, with the real Azure AD
-  values baked in as Vite env vars
-- Deploy the built `frontend/dist` to the Static Web App
+Push to `main` touching `backend/`, `frontend/`, or the workflow file
+itself, or trigger manually:
+```bash
+gh workflow run deploy.yml -R <owner>/<repo>
+gh run watch <run-id> -R <owner>/<repo> --exit-status
+```
 
-## 4. Test it live
+It will: install backend deps + `pytest`, `docker build`/`push` to ACR,
+`az containerapp update` with the new image, `npm ci && npm run build` for
+the frontend with real Azure AD values baked in, then deploy `frontend/dist`
+to the Static Web App via `Azure/static-web-apps-deploy@v1`.
+
+**Known footgun**: that action's `app_location`/`output_location` pair only
+works one way for a pre-built (`skip_app_build: true`) deploy - set
+`app_location: frontend/dist` and `output_location: ""` (empty). The
+reversed combination (`app_location: frontend`, `output_location: dist`)
+silently uploads the raw source `index.html` (which references
+`/src/main.jsx` for Vite's dev server) instead of the actual built bundle,
+producing a blank page with a browser console error about MIME type
+`application/octet-stream` on a module script.
+
+## 5. Test it live
 
 ```bash
-curl -i https://<containerAppName>.<region>.azurecontainerapps.io/health
-# {"status":"ok"}
+curl -i https://apim-itp-demo-dev.azure-api.net/health
+# {"status":"ok"} - public, no token needed
+
+curl -i https://apim-itp-demo-dev.azure-api.net/api/profile
+# 401 "Unauthorized - invalid or missing token" - correct, no token sent
 ```
 
-Open `https://<swa-hostname>/`, sign in with Microsoft, confirm
-`/api/profile` returns your name and the `roles` claim from whichever demo
-AD group (`terraform output role_group_object_ids`) you added yourself to.
+Open the Static Web App URL, sign in, click "Call protected API
+(/api/profile)". The response's `trust_path` field tells you which code
+path the backend actually took:
+- `"trust_path": "apim_headers"` - request went through APIM, APIM
+  validated the real token, backend trusted the injected headers. This is
+  the only value you should see once APIM is in front.
+- Anything else / a raw-JWT-validation error - means the request bypassed
+  APIM and hit the Container App directly, or `TRUST_APIM_HEADERS` isn't
+  actually `True` on the deployed Container App - verify with:
+  ```bash
+  az containerapp show --name ca-itp-backend-dev --resource-group rg-itp-demo-dev \
+    --query "properties.template.containers[0].env[?name=='TRUST_APIM_HEADERS']"
+  ```
 
-## 5. Not yet wired: APIM
+To see a non-empty `roles` array, add yourself to one of the demo groups
+first (`terraform output role_group_object_ids` in `infra/terraform`), then
+**sign all the way out and back in** - MSAL caches the access token for its
+full lifetime, so just reloading the page or clicking the button again
+reuses the same stale token and won't pick up a new role/group assignment
+or app-registration change (like the `name` optional claim) until the
+cache is cleared by a fresh sign-in.
 
-The `apim/` folder's `validate-jwt-policy.xml` is not deployed by this
-guide - right now the frontend calls the Container App directly
-(`TRUST_APIM_HEADERS=False`, same as local dev). Putting APIM in front
-(Consumption SKU is the fastest/cheapest tier to provision for testing) is
-a follow-up phase: stand up the APIM instance, import the Container App as
-its backend, create the Named Values (`tenant-id`, `api-audience`,
-`api-client-id`, `backend-id`) per `apim/README.md`, apply the policy, then
-flip `TRUST_APIM_HEADERS=True` and point the frontend's `VITE_API_BASE_URL`
-at the APIM gateway URL instead of the Container App's FQDN directly.
+## Known bugs fixed during this deployment (for reference)
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Blank page, "MIME type application/octet-stream" console error | SWA deploy uploaded raw source instead of the Vite build | `app_location: frontend/dist`, `output_location: ""` |
+| `loginPopup` hangs, popup shows "This site can't be reached" on `login.microsoft.com/consumers/fido/get` | Corporate network blocks the passkey/FIDO broker endpoint that popup-based MSAL flows probe | Switched to `loginRedirect` / `logoutRedirect` |
+| APIM apply reverts Container App to placeholder image | Terraform doesn't know the CI pipeline updated the image via `az cli` out-of-band | `lifecycle { ignore_changes = [template[0].container[0].image] }` |
+| `/health` requires a token even though it's meant to be public | `validate-jwt` policy applied at API level affects every operation | Split into API-level base policy (no auth) + operation-level auth policy on `/api/profile` only |
+| Every APIM request rejected with "missing subscription key" | `azurerm_api_management_api.subscription_required` defaults to `true` | Set `subscription_required = false` |
+| Terraform apply error: `expected "value" to not be an empty string` on a Named Value | Azure API Management Named Values cannot be empty; the policy's path-prefix rewrite assumed an empty prefix was valid | Removed the rewrite-uri entirely - operation URL templates already match the backend paths exactly |
+| `az acr build` fails: `TasksOperationsNotAllowed` | ACR Tasks blocked on this subscription (common on trial/student subscriptions) | Build with plain `docker build`/`push` on a GitHub Actions hosted runner instead |
+| GitHub secret silently wrong value despite being set correctly | `"value" \| gh secret set NAME` pipes through PowerShell's stdin, which appends a trailing newline | Use `gh secret set NAME --body "value"` instead |
+| `/api/profile` shows the opaque subject ID as `"name"` instead of the real display name | Access tokens for a custom API audience don't include a `name` claim by default (unlike ID tokens), and the policy never forwarded one | Added `optional_claims.access_token { name = "name" }` on the app registration + an `X-User-Name` header in the policy |
+| Identifier URI / API permissions silently empty after an unrelated app registration update | Confirmed azuread provider behavior - see the footgun note in section 1 | Always `terraform plan` again immediately after any apply touching `azuread_application.app`, reapply if drift shown |
