@@ -84,6 +84,16 @@ resource "azuread_application" "app" {
       value                  = app_role.value.value
     }
   }
+
+  # Access tokens for a custom API audience don't include "name" by default
+  # the way ID tokens do - without this, APIM's X-User-Name extraction (and
+  # anything else reading the "name" claim off the access token) gets
+  # nothing back, regardless of Graph "profile" scope consent.
+  optional_claims {
+    access_token {
+      name = "name"
+    }
+  }
 }
 
 # Application ID URI - api://<client_id> by default, or a custom domain URI

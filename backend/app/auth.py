@@ -170,6 +170,7 @@ async def get_current_user(
     request: Request,
     authorization: Optional[str] = Header(default=None),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+    x_user_name: Optional[str] = Header(default=None, alias="X-User-Name"),
     x_user_roles: Optional[str] = Header(default=None, alias="X-User-Roles"),
 ) -> CurrentUser:
     """FastAPI dependency - use as `user: CurrentUser = Depends(get_current_user)`."""
@@ -186,7 +187,10 @@ async def get_current_user(
                 "check the APIM validate-jwt policy is applied and forwarding it",
             )
         roles = x_user_roles.split(",") if x_user_roles else []
-        return CurrentUser(subject=x_user_id, name=x_user_id, roles=roles, raw_claims={})
+        # X-User-Name falls back to the subject (opaque pairwise ID) if the
+        # policy didn't send it - matches the access token itself falling
+        # back the same way when the "name" optional claim isn't present.
+        return CurrentUser(subject=x_user_id, name=x_user_name or x_user_id, roles=roles, raw_claims={})
 
     # Path 2: validate the raw bearer token ourselves.
     if not authorization or not authorization.lower().startswith("bearer "):

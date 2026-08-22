@@ -1,7 +1,7 @@
 <!--
   APIM inbound policy - validates the Entra ID access token at the gateway,
-  then forwards a plain X-User-Id / X-User-Roles header pair to FastAPI and
-  strips the raw Authorization header before forwarding.
+  then forwards plain X-User-Id / X-User-Name / X-User-Roles headers to
+  FastAPI and strips the raw Authorization header before forwarding.
 
   This is the SAME defense-in-depth pattern already used in the CTC ITP
   Release 2 architecture (see CTC_ITP_R2_Technical_Architecture.docx,
@@ -111,12 +111,25 @@
             var roles = jwt?.Claims.ContainsKey(&quot;roles&quot;) == true ? jwt.Claims[&quot;roles&quot;] : new string[0];
             return string.Join(&quot;,&quot;, roles);
         }" />
+        <!-- "name" is only present on the access token if the API app
+             registration requests it via optional_claims.access_token -
+             ID tokens get it by default, access tokens for a custom
+             resource audience do not. Falls back to the subject (opaque
+             pairwise ID) if absent, matching what the backend already did
+             before this header existed. -->
+        <set-variable name="jwtName" value="@{
+            var jwt = context.Request.Headers.GetValueOrDefault(&quot;Authorization&quot;,&quot;&quot;).Split(' ').Last().AsJwt();
+            return jwt?.Claims.ContainsKey(&quot;name&quot;) == true ? jwt.Claims.GetValueOrDefault(&quot;name&quot;,&quot;&quot;) : jwt?.Subject;
+        }" />
 
         <set-header name="X-User-Id" exists-action="override">
             <value>@((string)context.Variables["jwtSubject"])</value>
         </set-header>
         <set-header name="X-User-Roles" exists-action="override">
             <value>@((string)context.Variables["jwtRoles"])</value>
+        </set-header>
+        <set-header name="X-User-Name" exists-action="override">
+            <value>@((string)context.Variables["jwtName"])</value>
         </set-header>
 
         <!-- 5. Strip the raw Authorization header before forwarding - FastAPI
