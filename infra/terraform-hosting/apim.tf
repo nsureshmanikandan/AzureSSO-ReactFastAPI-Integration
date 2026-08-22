@@ -30,6 +30,11 @@ resource "azurerm_api_management_api" "backend" {
   protocols            = ["https"]
   service_url          = "https://${azurerm_container_app.backend.ingress[0].fqdn}"
   revision             = "1"
+
+  # No APIM product/subscription concept in this design - auth is JWT-only.
+  # Defaults to true, which would otherwise reject every request with
+  # "missing subscription key" regardless of a valid bearer token.
+  subscription_required = false
 }
 
 resource "azurerm_api_management_api_operation" "health" {
@@ -86,13 +91,30 @@ resource "azurerm_api_management_named_value" "backend_id" {
   value                = azurerm_api_management_backend.itp_backend.name
 }
 
+# Applies to EVERY operation, including the public /health one - CORS and
+# backend routing only, no auth.
 resource "azurerm_api_management_api_policy" "backend" {
+  api_name             = azurerm_api_management_api.backend.name
+  api_management_name = azurerm_api_management.main.name
+  resource_group_name = azurerm_resource_group.main.name
+  xml_content          = file("${path.module}/../../apim/api-base-policy.xml")
+
+  depends_on = [
+    azurerm_api_management_named_value.backend_id,
+  ]
+}
+
+# Only /api/profile requires a validated token - attached at the operation
+# level (not the API level) so /health stays public.
+resource "azurerm_api_management_api_operation_policy" "profile_auth" {
+  operation_id        = azurerm_api_management_api_operation.profile.operation_id
   api_name             = azurerm_api_management_api.backend.name
   api_management_name = azurerm_api_management.main.name
   resource_group_name = azurerm_resource_group.main.name
   xml_content          = file("${path.module}/../../apim/validate-jwt-policy.xml")
 
   depends_on = [
+    azurerm_api_management_api_policy.backend,
     azurerm_api_management_named_value.tenant_id,
     azurerm_api_management_named_value.api_audience,
     azurerm_api_management_named_value.api_client_id,

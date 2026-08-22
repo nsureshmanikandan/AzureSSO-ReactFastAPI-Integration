@@ -1,0 +1,40 @@
+<!--
+  API-level policy - applies to EVERY operation on this API, including
+  public ones like /health. Deliberately does NOT include validate-jwt:
+  that's applied per-operation instead (see validate-jwt-policy.xml,
+  attached only to the protected /api/profile operation), so a public
+  health-check endpoint isn't accidentally forced behind auth just because
+  it shares an API with a protected one.
+-->
+<policies>
+    <inbound>
+        <base />
+        <cors allow-credentials="true">
+            <allowed-origins>
+                <origin>http://localhost:5173</origin>
+                <origin>https://proud-ground-00667a40f.7.azurestaticapps.net</origin>
+            </allowed-origins>
+            <allowed-methods>
+                <method>GET</method>
+                <method>POST</method>
+                <method>PUT</method>
+                <method>DELETE</method>
+                <method>OPTIONS</method>
+            </allowed-methods>
+            <allowed-headers>
+                <header>*</header>
+            </allowed-headers>
+        </cors>
+        <set-query-parameter name="subscription-key" exists-action="delete" />
+        <set-backend-service backend-id="{{backend-id}}" />
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>

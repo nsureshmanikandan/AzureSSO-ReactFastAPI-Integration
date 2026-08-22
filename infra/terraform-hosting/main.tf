@@ -49,7 +49,7 @@ resource "azurerm_container_app" "backend" {
       }
       env {
         name  = "TRUST_APIM_HEADERS"
-        value = "False"
+        value = "True"
       }
       env {
         name  = "ALLOWED_ORIGINS"
@@ -76,6 +76,15 @@ resource "azurerm_container_app" "backend" {
   secret {
     name  = "acr-password"
     value = azurerm_container_registry.main.admin_password
+  }
+
+  # The CI/CD pipeline (az containerapp update) owns the deployed image
+  # after the first apply - without this, any unrelated `terraform apply`
+  # here reverts the Container App back to this placeholder, undoing
+  # whatever the pipeline last deployed. Confirmed live 2026-08-22: the
+  # APIM apply below did exactly this.
+  lifecycle {
+    ignore_changes = [template[0].container[0].image]
   }
 }
 
